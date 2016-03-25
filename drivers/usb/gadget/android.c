@@ -2334,16 +2334,13 @@ static struct android_usb_function *supported_functions[] = {
 	&qdss_function,
 	&serial_function,
 	&adb_function,
-	&hid_function,
-	NULL
 
 #ifdef CONFIG_MACH_MSM8974_14001
-//Wangwei@Prd.Android.USB, 2014/06/12, Add for support odb	
+//Wangwei@Prd.Android.USB, 2014/06/12, Add for support odb
 #ifndef CONFIG_MACH_MSM8974_14001
 	&odb_function,
 #endif  /* CONFIG_MACH_MSM8974_14001 */
 #endif /* CONFIG_MACH_MSM8974_14001 */
-	
 	&ccid_function,
 	&acm_function,
 	&mtp_function,
@@ -2361,6 +2358,7 @@ static struct android_usb_function *supported_functions[] = {
 #ifdef CONFIG_SND_RAWMIDI
 	&midi_function,
 #endif
+	&hid_function,
 	NULL
 };
 
