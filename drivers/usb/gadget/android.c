@@ -34,10 +34,6 @@
 #include <mach/diag_dload.h>
 
 #include "gadget_chips.h"
-#ifdef CONFIG_MACH_MSM8974_14001
-//Xinhua.Song@OnlineRd.Driver, 2014/04/15, Add for support mass storage in recovery mode
-#include <linux/boot_mode.h>
-#endif /* CONFIG_MACH_MSM8974_14001 */
 
 /*
  * Kbuild is not very cooperative with respect to linking separately
@@ -64,6 +60,7 @@
 #ifdef CONFIG_SND_PCM
 #include "f_audio_source.c"
 #endif
+#include "f_fs.c"
 #include "f_mass_storage.c"
 #include "u_serial.c"
 #include "u_sdio.c"
@@ -78,20 +75,9 @@
 #include "f_serial.c"
 #include "f_acm.c"
 #include "f_adb.c"
-
-#ifdef CONFIG_MACH_MSM8974_14001
-//Wangwei@Prd.Android.USB, 2014/06/12, Add for support odb
-#ifndef CONFIG_MACH_MSM8974_14001
-#include "f_odb.c"
-#endif  /* CONFIG_MACH_MSM8974_14001 */
-#endif  /* CONFIG_MACH_MSM8974_14001 */
-
 #include "f_ccid.c"
 #include "f_mtp.c"
 #include "f_accessory.c"
-#include "f_hid.h"
-#include "f_hid_android_keyboard.c"
-#include "f_hid_android_mouse.c"
 #define USB_ETH_RNDIS y
 #include "f_rndis.c"
 #include "rndis.c"
@@ -234,6 +220,8 @@ struct android_dev {
 
 	/* A list node inside the android_dev_list */
 	struct list_head list_item;
+
+	char ffs_aliases[256];
 };
 
 struct android_configuration {
@@ -285,26 +273,6 @@ static struct usb_gadget_strings *dev_strings[] = {
 	&stringtab_dev,
 	NULL,
 };
-
-#ifdef CONFIG_MACH_MSM8974_14001
-//Zhilong.Zhang@OnlineRd.Driver, 2014/03/11, Add for disable usb serial number in RF or WLAN mode
-static struct usb_string strings_dev_no_serial[] = {
-	[STRING_MANUFACTURER_IDX].s = manufacturer_string,
-	[STRING_PRODUCT_IDX].s = product_string,
-	//[STRING_SERIAL_IDX].s = serial_string,
-	{  }			/* end of list */
-};
-
-static struct usb_gadget_strings stringtab_dev_no_serial = {
-	.language	= 0x0409,	/* en-us */
-	.strings	= strings_dev_no_serial,
-};
-
-static struct usb_gadget_strings *dev_strings_no_serial[] = {
-	&stringtab_dev_no_serial,
-	NULL,
-};
-#endif /* CONFIG_MACH_MSM8974_14001 */
 
 static struct usb_device_descriptor device_desc = {
 	.bLength              = sizeof(device_desc),
@@ -370,12 +338,6 @@ static void android_work(struct work_struct *data)
 	static enum android_device_state last_uevent, next_state;
 	unsigned long flags;
 	int pm_qos_vote = -1;
-/* OPPO 2013-12-06 wangjc Add begin for sovle some pc can't charge problem */
-#ifdef CONFIG_MACH_MSM8974_14001
-	static bool connect_count = false;
-	struct usb_gadget	*gadget = cdev->gadget;
-#endif
-/* OPPO 2013-12-06 wangjc Add end */
 
 	spin_lock_irqsave(&cdev->lock, flags);
 	if (dev->suspended != dev->sw_suspended && cdev->config) {
@@ -430,19 +392,6 @@ static void android_work(struct work_struct *data)
 					   uevent_envp);
 			last_uevent = next_state;
 		}
-/* OPPO 2013-12-06 wangjc Add begin for sovle some pc can't charge problem */
-#ifdef CONFIG_MACH_MSM8974_14001
-		if(uevent_envp == connected) {
-			if(connect_count == false) {
-				connect_count = true;
-			}else {
-				connect_count = false;
-				
-				usb_gadget_vbus_draw(gadget, CONFIG_USB_GADGET_VBUS_DRAW);
-			}
-		}
-#endif
-/* OPPO 2013-12-06 wangjc Add end */
 		pr_info("%s: sent uevent %s\n", __func__, uevent_envp[0]);
 	} else {
 		pr_info("%s: did not send uevent (%d %d %p)\n", __func__,
@@ -493,6 +442,191 @@ static void android_disable(struct android_dev *dev)
 
 /*-------------------------------------------------------------------------*/
 /* Supported functions initialization */
+
+struct functionfs_config {
+	bool opened;
+	bool enabled;
+	struct ffs_data *data;
+	struct android_dev *dev;
+};
+
+static int ffs_function_init(struct android_usb_function *f,
+			     struct usb_composite_dev *cdev)
+{
+	f->config = kzalloc(sizeof(struct functionfs_config), GFP_KERNEL);
+	if (!f->config)
+		return -ENOMEM;
+
+	return functionfs_init();
+}
+
+static void ffs_function_cleanup(struct android_usb_function *f)
+{
+	functionfs_cleanup();
+	kfree(f->config);
+}
+
+static void ffs_function_enable(struct android_usb_function *f)
+{
+	struct android_dev *dev = f->android_dev;
+	struct functionfs_config *config = f->config;
+
+	config->enabled = true;
+
+	/* Disable the gadget until the function is ready */
+	if (!config->opened)
+		android_disable(dev);
+}
+
+static void ffs_function_disable(struct android_usb_function *f)
+{
+	struct android_dev *dev = f->android_dev;
+	struct functionfs_config *config = f->config;
+
+	config->enabled = false;
+
+	/* Balance the disable that was called in closed_callback */
+	if (!config->opened)
+		android_enable(dev);
+}
+
+static int ffs_function_bind_config(struct android_usb_function *f,
+				    struct usb_configuration *c)
+{
+	struct functionfs_config *config = f->config;
+	return functionfs_bind_config(c->cdev, c, config->data);
+}
+
+static ssize_t
+ffs_aliases_show(struct device *pdev, struct device_attribute *attr, char *buf)
+{
+	struct android_dev *dev;
+	int ret;
+
+	dev = list_first_entry(&android_dev_list, struct android_dev,
+			list_item);
+
+	mutex_lock(&dev->mutex);
+	ret = sprintf(buf, "%s\n", dev->ffs_aliases);
+	mutex_unlock(&dev->mutex);
+
+	return ret;
+}
+
+static ssize_t
+ffs_aliases_store(struct device *pdev, struct device_attribute *attr,
+					const char *buf, size_t size)
+{
+	struct android_dev *dev;
+	char buff[256];
+
+	dev = list_first_entry(&android_dev_list, struct android_dev,
+			list_item);
+
+	mutex_lock(&dev->mutex);
+
+	if (dev->enabled) {
+		mutex_unlock(&dev->mutex);
+		return -EBUSY;
+	}
+
+	strlcpy(buff, buf, sizeof(buff));
+	strlcpy(dev->ffs_aliases, strim(buff), sizeof(dev->ffs_aliases));
+
+	mutex_unlock(&dev->mutex);
+
+	return size;
+}
+
+static DEVICE_ATTR(aliases, S_IRUGO | S_IWUSR, ffs_aliases_show,
+					       ffs_aliases_store);
+static struct device_attribute *ffs_function_attributes[] = {
+	&dev_attr_aliases,
+	NULL
+};
+
+static struct android_usb_function ffs_function = {
+	.name		= "ffs",
+	.init		= ffs_function_init,
+	.enable		= ffs_function_enable,
+	.disable	= ffs_function_disable,
+	.cleanup	= ffs_function_cleanup,
+	.bind_config	= ffs_function_bind_config,
+	.attributes	= ffs_function_attributes,
+};
+
+static int functionfs_ready_callback(struct ffs_data *ffs)
+{
+	struct android_dev *dev = ffs_function.android_dev;
+	struct functionfs_config *config = ffs_function.config;
+	int ret = 0;
+
+	/* dev is null in case ADB is not in the composition */
+	if (dev) {
+		mutex_lock(&dev->mutex);
+		ret = functionfs_bind(ffs, dev->cdev);
+		if (ret) {
+			mutex_unlock(&dev->mutex);
+			return ret;
+		}
+	} else {
+		/* android ffs_func requires daemon to start only after enable*/
+		pr_debug("start adbd only in ADB composition\n");
+		return -ENODEV;
+	}
+
+	config->data = ffs;
+	config->opened = true;
+	/* Save dev in case the adb function will get disabled */
+	config->dev = dev;
+
+	if (config->enabled)
+		android_enable(dev);
+
+	mutex_unlock(&dev->mutex);
+
+	return 0;
+
+}
+
+static void functionfs_closed_callback(struct ffs_data *ffs)
+{
+	struct android_dev *dev = ffs_function.android_dev;
+	struct functionfs_config *config = ffs_function.config;
+
+	/*
+	 * In case new composition is without ADB or ADB got disabled by the
+	 * time ffs_daemon was stopped then use saved one
+	 */
+	if (!dev)
+		dev = config->dev;
+
+	/* fatal-error: It should never happen */
+	if (!dev)
+		pr_err("adb_closed_callback: config->dev is NULL");
+
+	if (dev)
+		mutex_lock(&dev->mutex);
+
+	if (config->enabled && dev)
+		android_disable(dev);
+
+	config->dev = NULL;
+
+	config->opened = false;
+	config->data = NULL;
+
+	functionfs_unbind(ffs);
+
+	if (dev)
+		mutex_unlock(&dev->mutex);
+}
+
+static int functionfs_check_dev_callback(const char *dev_name)
+{
+	return 0;
+}
+
 
 struct adb_data {
 	bool opened;
@@ -605,126 +739,6 @@ static void adb_closed_callback(void)
 }
 
 
-#ifdef CONFIG_MACH_MSM8974_14001
-//LinJie.Xu@Prd.Android.USB, 2014/06/12, Add for Support odb 
-#ifndef CONFIG_MACH_MSM8974_14001
-/*-------------------------------------------------------------------------*/
-/* Supported functions initialization */
-
-struct odb_data {
-	bool opened;
-	bool enabled;
-	struct android_dev *dev;
-};
-
-static void odb_function_cleanup(struct android_usb_function *f)
-{
-	pr_err("%s: odb_function_cleanup OK\n", __func__);
-	odb_cleanup();
-	kfree(f->config);
-}
-
-static int
-odb_function_bind_config(struct android_usb_function *f,
-		struct usb_configuration *c)
-{
-	pr_err("%s: odb_function_bind_config OK\n", __func__);
-	return odb_bind_config(c);
-}
-
-static void odb_android_function_enable(struct android_usb_function *f)
-{
-	struct android_dev *dev = f->android_dev;
-	struct odb_data *data = f->config;
-	pr_err("%s: odb_android_function_enable OK\n", __func__);
-	data->enabled = true;
-
-
-	/* Disable the gadget until adbd is ready */
-	if (!data->opened)
-		android_disable(dev);
-}
-
-static int
-odb_function_init(struct android_usb_function *f,
-		struct usb_composite_dev *cdev)
-{
-	pr_err("%s: odb_function_init OK\n", __func__);
-	f->config = kzalloc(sizeof(struct odb_data), GFP_KERNEL);
-	if (!f->config)
-		return -ENOMEM;
-
-	return odb_setup();
-}
-
-static void odb_android_function_disable(struct android_usb_function *f)
-{
-	struct android_dev *dev = f->android_dev;
-	struct odb_data *data = f->config;
-	pr_err("%s: odb_android_function_disable OK\n", __func__);
-	data->enabled = false;
-
-	/* Balance the disable that was called in closed_callback */
-	if (!data->opened)
-		android_enable(dev);
-}
-
-static struct android_usb_function odb_function = {
-	.name		= "odb",
-	.enable		= odb_android_function_enable,
-	.disable	= odb_android_function_disable,
-	.init		= odb_function_init,
-	.cleanup	= odb_function_cleanup,
-	.bind_config	= odb_function_bind_config,
-};
-
-static void odb_ready_callback(void)
-{
-	struct android_dev *dev = odb_function.android_dev;
-	struct odb_data *data = odb_function.config;
-
-	/* dev is null in case ADB is not in the composition */
-	if (dev)
-		mutex_lock(&dev->mutex);
-
-	/* Save dev in case the adb function will get disabled */
-	data->dev = dev;
-	data->opened = true;
-
-	if (data->enabled && dev)
-		android_enable(dev);
-
-	if (dev)
-		mutex_unlock(&dev->mutex);
-}
-
-static void odb_closed_callback(void)
-{
-	struct odb_data *data = odb_function.config;
-	struct android_dev *dev = odb_function.android_dev;
-
-	/* In case new composition is without ODB, use saved one */
-	if (!dev)
-		dev = data->dev;
-
-	if (!dev)
-		pr_err("odb_closed_callback: data->dev is NULL");
-
-	if (dev)
-		mutex_lock(&dev->mutex);
-
-	data->opened = false;
-
-	if (data->enabled && dev)
-		android_disable(dev);
-
-	data->dev = NULL;
-
-	if (dev)
-		mutex_unlock(&dev->mutex);
-}
-#endif  /* CONFIG_MACH_MSM8974_14001 */  
-#endif /* CONFIG_MACH_MSM8974_14001 */
 /*-------------------------------------------------------------------------*/
 /* Supported functions initialization */
 
@@ -1952,12 +1966,9 @@ static int mass_storage_function_init(struct android_usb_function *f,
 	struct mass_storage_function_config *config;
 	struct fsg_common *common;
 	int err;
-	int i;
-	char name[FSG_MAX_LUNS][MAX_LUN_NAME];	
-	#ifndef CONFIG_MACH_MSM8974_14001 
-	int n;
+	int i, n;
+	char name[FSG_MAX_LUNS][MAX_LUN_NAME];
 	u8 uicc_nluns = dev->pdata ? dev->pdata->uicc_nluns : 0;
-	#endif
 
 	config = kzalloc(sizeof(struct mass_storage_function_config),
 								GFP_KERNEL);
@@ -1982,9 +1993,6 @@ static int mass_storage_function_init(struct android_usb_function *f,
 		snprintf(name[config->fsg.nluns], MAX_LUN_NAME, "lun1");
 		config->fsg.nluns++;
 	}
-#ifndef CONFIG_MACH_MSM8974_14001 
-//Xinhua.song@OnlineRd.Driver, 2014/04/15, Modify for support CD-ROM in normal mode and support mass storage in recovery mode
-	//config->fsg.luns[0].removable = 1; //patch deleted it
 
 	if (uicc_nluns > FSG_MAX_LUNS - config->fsg.nluns) {
 		uicc_nluns = FSG_MAX_LUNS - config->fsg.nluns;
@@ -1997,17 +2005,6 @@ static int mass_storage_function_init(struct android_usb_function *f,
 		config->fsg.luns[n].removable = 1;
 		config->fsg.nluns++;
 	}
-		
-#else /* CONFIG_MACH_MSM8974_14001 */
-	if(get_boot_mode() == MSM_BOOT_MODE__RECOVERY) {
-		config->fsg.luns[0].removable = 1;
-	}
-	else {
-		config->fsg.luns[0].cdrom = 1;
-		config->fsg.luns[0].ro = 1;
-		config->fsg.luns[0].removable = 0;	
-	}
-#endif /* CONFIG_MACH_MSM8974_14001 */	
 
 	common = fsg_common_init(NULL, cdev, &config->fsg);
 	if (IS_ERR(common)) {
@@ -2229,41 +2226,6 @@ static struct android_usb_function uasp_function = {
 	.bind_config	= uasp_function_bind_config,
 };
 
-static int hid_function_init(struct android_usb_function *f, struct usb_composite_dev *cdev)
-{
- return ghid_setup(cdev->gadget, 2);
-}
-
-static void hid_function_cleanup(struct android_usb_function *f)
-{
- ghid_cleanup();
-}
-
-static int hid_function_bind_config(struct android_usb_function *f, struct usb_configuration *c)
-{
- int ret;
- printk(KERN_INFO "hid keyboard\n");
- ret = hidg_bind_config(c, &ghid_device_android_keyboard, 0);
- if (ret) {
-   pr_info("%s: hid_function_bind_config keyboard failed: %d\n", __func__, ret);
-   return ret;
- }
- printk(KERN_INFO "hid mouse\n");
- ret = hidg_bind_config(c, &ghid_device_android_mouse, 1);
- if (ret) {
-   pr_info("%s: hid_function_bind_config mouse failed: %d\n", __func__, ret);
-   return ret;
- }
- return 0;
-}
-
-static struct android_usb_function hid_function = {
- .name   = "hid",
- .init   = hid_function_init,
- .cleanup  = hid_function_cleanup,
- .bind_config  = hid_function_bind_config,
-};
-
 #ifdef CONFIG_SND_RAWMIDI
 static int midi_function_init(struct android_usb_function *f,
 					struct usb_composite_dev *cdev)
@@ -2320,6 +2282,7 @@ static struct android_usb_function midi_function = {
 };
 #endif
 static struct android_usb_function *supported_functions[] = {
+	&ffs_function,
 	&mbim_function,
 	&ecm_qc_function,
 #ifdef CONFIG_SND_PCM
@@ -2334,16 +2297,6 @@ static struct android_usb_function *supported_functions[] = {
 	&qdss_function,
 	&serial_function,
 	&adb_function,
-	&hid_function,
-	NULL
-
-#ifdef CONFIG_MACH_MSM8974_14001
-//Wangwei@Prd.Android.USB, 2014/06/12, Add for support odb	
-#ifndef CONFIG_MACH_MSM8974_14001
-	&odb_function,
-#endif  /* CONFIG_MACH_MSM8974_14001 */
-#endif /* CONFIG_MACH_MSM8974_14001 */
-	
 	&ccid_function,
 	&acm_function,
 	&mtp_function,
@@ -2637,9 +2590,12 @@ functions_store(struct device *pdev, struct device_attribute *attr,
 	struct android_configuration *conf;
 	char *conf_str;
 	struct android_usb_function_holder *f_holder;
-	char *name;
+	char *name = NULL;
 	char buf[256], *b;
+	char aliases[256], *a;
 	int err;
+	int is_ffs;
+	int ffs_enabled = 0;
 
 	mutex_lock(&dev->mutex);
 
@@ -2667,29 +2623,50 @@ functions_store(struct device *pdev, struct device_attribute *attr,
 
 	while (b) {
 		conf_str = strsep(&b, ":");
-		if (conf_str) {
-			/* If the next not equal to the head, take it */
-			if (curr_conf->next != &dev->configs)
-				conf = list_entry(curr_conf->next,
-						  struct android_configuration,
-						  list_item);
-			else
-				conf = alloc_android_config(dev);
+		if (!conf_str)
+			continue;
 
-			curr_conf = curr_conf->next;
-		}
+		/* If the next not equal to the head, take it */
+		if (curr_conf->next != &dev->configs)
+			conf = list_entry(curr_conf->next,
+					  struct android_configuration,
+					  list_item);
+		else
+			conf = alloc_android_config(dev);
+
+		curr_conf = curr_conf->next;
 
 		while (conf_str) {
 			name = strsep(&conf_str, ",");
-			if (name) {
-				err = android_enable_function(dev, conf, name);
-				if (err)
-					pr_err("android_usb: Cannot enable %s",
-						name);
+
+			is_ffs = 0;
+			strlcpy(aliases, dev->ffs_aliases, sizeof(aliases));
+			a = aliases;
+
+			while (a) {
+				char *alias = strsep(&a, ",");
+				if (alias && !strcmp(name, alias)) {
+					is_ffs = 1;
+					break;
+				}
 			}
+
+			if (is_ffs) {
+				if (ffs_enabled)
+					continue;
+				err = android_enable_function(dev, conf, "ffs");
+				if (err)
+					pr_err("android_usb: Cannot enable ffs (%d)",
+										err);
+				else
+					ffs_enabled = 1;
+				continue;
+			}
+			err = android_enable_function(dev, conf, name);
+			if (err)
+				pr_err("android_usb: Cannot enable '%s' (%d)",
+						name, err);
 		}
-		/* HID driver always enabled, it's the whole point of this kernel patch */
-		android_enable_function(dev, conf, "hid");
 	}
 
 	/* Free uneeded configurations if exists */
@@ -2874,31 +2851,7 @@ DESCRIPTOR_ATTR(bDeviceSubClass, "%d\n")
 DESCRIPTOR_ATTR(bDeviceProtocol, "%d\n")
 DESCRIPTOR_STRING_ATTR(iManufacturer, manufacturer_string)
 DESCRIPTOR_STRING_ATTR(iProduct, product_string)
-#ifndef CONFIG_MACH_MSM8974_14001
-//Zhilong.Zhang@OnlineRd.Driver, 2014/03/11, Modify for disable usb serial number in RF or WLAN mode
 DESCRIPTOR_STRING_ATTR(iSerial, serial_string)
-#else /* CONFIG_MACH_MSM8974_14001 */
-static ssize_t
-iSerial_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%s", serial_string);
-}
-static ssize_t
-iSerial_store(struct device *dev, struct device_attribute *attr,
-		const char *buf, size_t size)
-{
- 	int boot_mode = get_boot_mode();
-	if(boot_mode == MSM_BOOT_MODE__RF || boot_mode == MSM_BOOT_MODE__WLAN)
-		return -EINVAL;
-	if (size >= sizeof(serial_string))
-		return -EINVAL;
-	strlcpy(serial_string, buf, sizeof(serial_string));
-	strim(serial_string);
-	return size;
-}
-static DEVICE_ATTR(iSerial, S_IRUGO | S_IWUSR, iSerial_show, iSerial_store);
-#endif /* CONFIG_MACH_MSM8974_14001 */
 
 static DEVICE_ATTR(functions, S_IRUGO | S_IWUSR, functions_show,
 						 functions_store);
@@ -2997,27 +2950,13 @@ static int android_bind(struct usb_composite_dev *cdev)
 	strlcpy(manufacturer_string, "Android",
 		sizeof(manufacturer_string) - 1);
 	strlcpy(product_string, "Android", sizeof(product_string) - 1);
-#ifndef CONFIG_MACH_MSM8974_14001
-//Zhilong.Zhang@OnlineRd.Driver, 2014/03/11, Modify for disable usb serial number in RF or WLAN mode	
 	strlcpy(serial_string, "0123456789ABCDEF", sizeof(serial_string) - 1);
-#else /* CONFIG_MACH_MSM8974_14001 */
-	if(get_boot_mode() != MSM_BOOT_MODE__RF && get_boot_mode() != MSM_BOOT_MODE__WLAN)
-		strlcpy(serial_string, "0123456789ABCDEF", sizeof(serial_string) - 1);
-#endif /* CONFIG_MACH_MSM8974_14001 */
 
 	id = usb_string_id(cdev);
 	if (id < 0)
 		return id;
-#ifndef CONFIG_MACH_MSM8974_14001
-//Zhilong.Zhang@OnlineRd.Driver, 2014/03/11, Modify for disable usb serial number in RF or WLAN mode	
 	strings_dev[STRING_SERIAL_IDX].id = id;
 	device_desc.iSerialNumber = id;
-#else /* CONFIG_MACH_MSM8974_14001 */
-	if(get_boot_mode() != MSM_BOOT_MODE__RF && get_boot_mode() != MSM_BOOT_MODE__WLAN) {
-		strings_dev[STRING_SERIAL_IDX].id = id;
-		device_desc.iSerialNumber = id;
-	}
-#endif /* CONFIG_MACH_MSM8974_14001 */
 
 	if (gadget_is_otg(cdev->gadget))
 		list_for_each_entry(conf, &dev->configs, list_item)
@@ -3054,17 +2993,6 @@ static struct usb_composite_driver android_usb_driver = {
 	.unbind		= android_usb_unbind,
 	.max_speed	= USB_SPEED_SUPER
 };
-
-#ifdef CONFIG_MACH_MSM8974_14001
-//Zhilong.Zhang@OnlineRd.Driver, 2014/03/11, Add for disable usb serial number in RF or WLAN mode
-static struct usb_composite_driver android_usb_driver_no_serial = {
-	.name		= "android_usb",
-	.dev		= &device_desc,
-	.strings	= dev_strings_no_serial,
-	.unbind		= android_usb_unbind,
-	.max_speed	= USB_SPEED_SUPER
-};
-#endif /* CONFIG_MACH_MSM8974_14001 */
 
 static int
 android_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c)
@@ -3410,15 +3338,7 @@ static int __devinit android_probe(struct platform_device *pdev)
 		goto err_dev;
 	}
 
-#ifndef CONFIG_MACH_MSM8974_14001
-//Zhilong.Zhang@OnlineRd.Driver, 2014/03/11, Modify for disable usb serial number in RF or WLAN mode
 	ret = usb_composite_probe(&android_usb_driver, android_bind);
-#else /* CONFIG_MACH_MSM8974_14001 */
-	if(get_boot_mode() == MSM_BOOT_MODE__RF || get_boot_mode() == MSM_BOOT_MODE__WLAN)
-		ret = usb_composite_probe(&android_usb_driver_no_serial, android_bind);
-	else
-		ret = usb_composite_probe(&android_usb_driver, android_bind);		
-#endif /* CONFIG_MACH_MSM8974_14001 */
 	if (ret) {
 		pr_err("%s(): Failed to register android "
 				 "composite driver\n", __func__);
