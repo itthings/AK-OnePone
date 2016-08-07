@@ -1,0 +1,16 @@
+if USB && MEDIA_SUPPORT
+menuconfig MEDIA_USB_SUPPORT
+	bool "Media USB Adapters"
+	help
+	  Enable media drivers for USB bus.
+	  If you have such devices, say Y.
+
+if MEDIA_USB_SUPPORT
+
+if MEDIA_SDR_SUPPORT
+	comment "Software defined radio USB devices"
+source "drivers/media/usb/hackrf/Kconfig"
+endif
+
+endif #MEDIA_USB_SUPPORT
+endif #USB

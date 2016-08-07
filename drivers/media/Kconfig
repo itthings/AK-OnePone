@@ -105,7 +105,7 @@ comment "Multimedia drivers"
 
 source "drivers/media/common/Kconfig"
 source "drivers/media/rc/Kconfig"
-
+source "drivers/media/usb/Kconfig"
 source "drivers/media/platform/Kconfig"
 
 #
